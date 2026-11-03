@@ -10,12 +10,14 @@ import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { moment } from "@webpack/common";
+import * as DataStore from "@api/DataStore";
 
 interface ScheduledMessage {
     channelId: string;
     content: string;
     scheduledTime: number;
     timeoutId: NodeJS.Timeout;
+    interval?: number;
 }
 
 const settings = definePluginSettings({
@@ -29,6 +31,55 @@ const settings = definePluginSettings({
 // Store for scheduled messages
 const scheduledMessages: ScheduledMessage[] = [];
 const logger = new Logger("MessageScheduler");
+
+interface StoredRecurringMessage {
+    channelId: string;
+    content: string;
+    interval: number;
+    scheduledTime: number;
+}
+
+const STORAGE_KEY = "MessageScheduler_recurring_v1";
+
+async function saveRecurringMessages() {
+    const recurring = scheduledMessages
+        .filter(msg => msg.interval !== undefined)
+        .map(msg => ({
+            channelId: msg.channelId,
+            content: msg.content,
+            interval: msg.interval!,
+            scheduledTime: msg.scheduledTime
+        }));
+
+    await DataStore.set(STORAGE_KEY, recurring);
+}
+
+async function restoreRecurringMessages() {
+    const stored = await DataStore.get(STORAGE_KEY) as
+        | StoredRecurringMessage[]
+        | undefined;
+
+    if (!Array.isArray(stored)) return;
+
+    for (const msg of stored) {
+        if (
+            !msg.channelId ||
+            typeof msg.content !== "string" ||
+            !Number.isFinite(msg.interval) ||
+            msg.interval <= 0 ||
+            !Number.isFinite(msg.scheduledTime)
+        ) continue;
+
+        const delay = Math.max(0, msg.scheduledTime - Date.now());
+
+        scheduleMessage(
+            msg.channelId,
+            msg.content,
+            delay,
+            msg.interval
+        );
+    }
+}
 
 // Parse relative time like "1h30m", "2d", "30s", etc.
 function parseRelativeTime(timeStr: string): number | null {
@@ -86,41 +137,74 @@ function parseExactTime(timeStr: string): number | null {
     return null;
 }
 
-// Schedule a message to be sent
-function scheduleMessage(channelId: string, content: string, delay: number): void {
-    const scheduledTime = Date.now() + delay;
-
-    const timeoutId = setTimeout(() => {
-        sendMessage(channelId, { content });
-
-        // Remove from scheduled messages
-        const index = scheduledMessages.findIndex(msg => msg.timeoutId === timeoutId);
-        if (index !== -1) {
-            scheduledMessages.splice(index, 1);
-        }
-
-        if (settings.store.showNotifications) {
-            Vencord.Webpack.Common.showToast({
-                variant: "success",
-                text: "Scheduled message sent!"
-            });
-        }
-    }, delay);
-
-    scheduledMessages.push({
+function scheduleMessage(
+    channelId: string,
+    content: string,
+    delay: number,
+    interval?: number
+): void {
+    const scheduled: ScheduledMessage = {
         channelId,
         content,
-        scheduledTime,
-        timeoutId
-    });
+        scheduledTime: Date.now() + delay,
+        timeoutId: undefined as unknown as NodeJS.Timeout,
+        interval
+    };
+
+    const scheduleNext = (nextDelay: number) => {
+        scheduled.scheduledTime = Date.now() + nextDelay;
+
+        scheduled.timeoutId = setTimeout(() => {
+            try {
+                sendMessage(channelId, { content });
+
+                if (settings.store.showNotifications) {
+                    Vencord.Webpack.Common.showToast({
+                        variant: "success",
+                        text: interval
+                            ? "Recurring scheduled message sent!"
+                            : "Scheduled message sent!"
+                    });
+                }
+            } catch (error) {
+                logger.error("Failed to send scheduled message", error);
+            }
+
+            if (scheduled.interval && scheduled.interval > 0) {
+                scheduleNext(scheduled.interval);
+
+                void saveRecurringMessages().catch(error =>
+                    logger.error("Failed to update recurring messages", error)
+                );
+            } else {
+                const index = scheduledMessages.indexOf(scheduled);
+                if (index !== -1) {
+                    scheduledMessages.splice(index, 1);
+                }
+            }
+        }, nextDelay);
+    };
+
+    scheduledMessages.push(scheduled);
+
+    if (interval !== undefined) {
+        void saveRecurringMessages().catch(error =>
+            logger.error("Failed to save recurring messages", error)
+        );
+    }
+
+    scheduleNext(delay);
 
     if (settings.store.showNotifications) {
         Vencord.Webpack.Common.showToast({
             variant: "success",
-            text: `Message scheduled for ${moment(scheduledTime).format("LT")}`
+            text: interval
+                ? `Recurring message scheduled every ${moment.duration(interval).humanize()}`
+                : `Message scheduled for ${moment(scheduled.scheduledTime).format("LT")}`
         });
     }
 }
+
 
 export default definePlugin({
     name: "MessageScheduler",
@@ -188,6 +272,67 @@ export default definePlugin({
                 });
             }
         },
+
+        {
+            name: "schedule-interval",
+            description: "Schedule a message to repeat at regular intervals",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            options: [
+                {
+                    name: "message",
+                    description: "The message to send repeatedly",
+                    type: ApplicationCommandOptionType.STRING,
+                    required: true
+                },
+                {
+                    name: "interval",
+                    description: "Time between messages (e.g. '30m', '2h', '1d')",
+                    type: ApplicationCommandOptionType.STRING,
+                    required: true
+                }
+            ],
+            execute: (args, ctx) => {
+                const message = args.find(
+                    arg => arg.name === "message"
+                )?.value as string;
+
+                const intervalStr = args.find(
+                    arg => arg.name === "interval"
+                )?.value as string;
+
+                if (!message?.trim() || !intervalStr?.trim()) {
+                    sendBotMessage(ctx.channel.id, {
+                        content: "❌ Please provide both a message and an interval."
+                    });
+                    return;
+                }
+
+                const interval = parseRelativeTime(intervalStr);
+
+                if (
+                    interval === null ||
+                    interval <= 0 ||
+                    !/^(\d+d)?(\d+h)?(\d+m)?(\d+s)?$/.test(intervalStr) ||
+                    !/\d+[dhms]/.test(intervalStr)
+                ) {
+                    sendBotMessage(ctx.channel.id, {
+                        content: "Invalid interval. Use formats like '30m', '2h', '1d', or '1h30m'."
+                    });
+                    return;
+                }
+
+                scheduleMessage(
+                    ctx.channel.id,
+                    message,
+                    interval,
+                    interval
+                );
+
+                sendBotMessage(ctx.channel.id, {
+                    content: `Recurring message scheduled every ${intervalStr}. Use /scheduled to view it or /cancel-scheduled to cancel it.`
+                });
+            }
+        },
         {
             name: "scheduled",
             description: "List all scheduled messages",
@@ -208,7 +353,10 @@ export default definePlugin({
                         ? msg.content.substring(0, 47) + "..."
                         : msg.content;
 
-                    return `${index + 1}. **${timeStr}**: ${preview}`;
+                    return `${index + 1}. **${timeStr}** ${msg.interval
+                        ? `(Repeats every ${moment.duration(msg.interval).humanize()})`
+                        : "(One-time)"
+                        }: ${preview}`;
                 }).join("\n");
 
                 sendBotMessage(ctx.channel.id, {
@@ -263,15 +411,28 @@ export default definePlugin({
                     scheduledMessages.splice(globalIndex, 1);
                 }
 
+                if (messageToCancel.interval !== undefined) {
+                    void saveRecurringMessages().catch(error =>
+                        logger.error("Failed to save cancellation", error)
+                    );
+                }
+
                 sendBotMessage(ctx.channel.id, {
-                    content: "✅ Scheduled message cancelled."
+                    content: "Scheduled message cancelled."
                 });
             }
         }
     ],
 
-    start() {
+    async start() {
         logger.info("Plugin started");
+
+        try {
+            await restoreRecurringMessages();
+            logger.info("Recurring messages restored");
+        } catch (error) {
+            logger.error("Failed to restore recurring messages", error);
+        }
     },
 
     stop() {

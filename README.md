@@ -14,6 +14,9 @@ A Vencord plugin that allows you to schedule Discord messages to be sent at a sp
 ### `/schedule`
 Schedule a message to be sent later.
 
+### `/schedule-interval`
+Schedule a message to repeat at regular intervals
+
 **Options:**
 - `message`: The message content to send
 - `time`: When to send the message (e.g., "1h30m", "3:30pm")
