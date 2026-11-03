@@ -45,3 +45,4 @@ Cancel a scheduled message.
 - `/schedule message: Hello world! time: 30m` - Send "Hello world!" in 30 minutes
 - `/schedule message: Good morning! time: 8:00am` - Send "Good morning!" at 8:00 AM
 - `/schedule message: Meeting reminder time: 1h15m` - Send "Meeting reminder" in 1 hour and 15 minutes
+- `/schedule-interval message: /daily time: 24h2m` - Send "/daily" every 24 hours and 2 minutes
